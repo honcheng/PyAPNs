@@ -77,17 +77,15 @@ ERROR_RESPONSE_FORMAT = (
 
 TOKEN_LENGTH = 32
 ERROR_RESPONSE_LENGTH = 6
-TIMEOUT_WAIT_READ_SECS = 0
 
 class APNs(object):
     """A class representing an Apple Push Notification service connection"""
 
-    def __init__(self, use_sandbox=False, cert_file=None, key_file=None, enhanced=False, read_response_timeout=TIMEOUT_WAIT_READ_SECS):
+    def __init__(self, use_sandbox=False, cert_file=None, key_file=None, enhanced=False):
         """
         Set use_sandbox to True to use the sandbox (test) APNs servers.
         Default is False.
         """
-        global TIMEOUT_WAIT_READ_SECS
         super(APNs, self).__init__()
         self.use_sandbox = use_sandbox
         self.cert_file = cert_file
@@ -95,7 +93,6 @@ class APNs(object):
         self._feedback_connection = None
         self._gateway_connection = None
         self.enhanced = enhanced
-        TIMEOUT_WAIT_READ_SECS = read_response_timeout
 
     @staticmethod
     def packed_uchar(num):
@@ -227,20 +224,6 @@ class APNsConnection(object):
                 _, wlist, _ = select.select([], [self._connection()], [])
             if len(wlist) > 0:
                 self._connection().sendall(string)
-#               self._connection().write(string)
-            
-#             rlist, _, _ = select.select([self._connection()], [], [], TIMEOUT_WAIT_READ_SECS)          
-#             
-#             if len(rlist) > 0: # there's error response from APNs
-#                 buff = self.read(ERROR_RESPONSE_LENGTH)
-#                 if len(buff) != ERROR_RESPONSE_LENGTH:
-#                     return None
-#                 command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
-#                 if 8 != command: # not error response
-#                     return None
-#                 self._disconnect()
-#                 self._connection().close()
-#                 return (status, identifier)
         else: # blocking socket
              return self._connection().sendall(string)
 
@@ -447,9 +430,6 @@ class GatewayConnection(APNsConnection):
 
         return notification
 
-#     def send_notification(self, token_hex, payload):
-#         self.write(self._get_notification(token_hex, payload))
-
     def _get_enhanced_notification(self, token_hex, payload, identifier, expiry):
          """
          form notification data in an enhanced format
@@ -503,9 +483,9 @@ class GatewayConnection(APNsConnection):
                 if len(buff) == ERROR_RESPONSE_LENGTH:
                     command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
                     if 8 == command: # is error response
-                        self._disconnect()
-#                         self._connection().close()
-#                         self.connection_built = False
+#                         self._disconnect()
+                        self._connection().close()
+                        self.connection_built = False
                         error_response = (status, identifier)
                         print "error-response:", error_response
                         self.error_responses.append(error_response)
