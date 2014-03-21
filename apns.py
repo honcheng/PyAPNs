@@ -493,7 +493,7 @@ class GatewayConnection(APNsConnection):
     
     def resent_notifications(self, failed_identifier):
         self.retrying = True
-        fail_idx = getListIndexFromID(self.sent_notifications, failed_identifier)
+        fail_idx = Util.getListIndexFromID(self.sent_notifications, failed_identifier)
         #pop-out success notifications till failed one
         self.sent_notifications = self.sent_notifications[fail_idx+1:]
         for sent_notification in self.sent_notifications:
@@ -501,6 +501,8 @@ class GatewayConnection(APNsConnection):
             self.write(sent_notification['message'])
         self.retrying = False
 
-def getListIndexFromID(the_list, identifier):
-    return next(index for (index, d) in enumerate(the_list) 
-                    if d['id'] == identifier)
+class Util(object):
+    @classmethod
+    def getListIndexFromID(the_list, identifier):
+        return next(index for (index, d) in enumerate(the_list) 
+                        if d['id'] == identifier)
