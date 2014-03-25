@@ -32,6 +32,7 @@ import sys
 import ssl
 import select
 import time
+import collections, itertools
 
 try:
     from ssl import wrap_socket
@@ -79,7 +80,8 @@ ERROR_RESPONSE_FORMAT = (
 
 TOKEN_LENGTH = 32
 ERROR_RESPONSE_LENGTH = 6
-DELAY_RESEND_SECS = 0
+DELAY_RESEND_SECS = 0.0
+SENT_BUFFER_QTY = 3000
 
 class APNs(object):
     """A class representing an Apple Push Notification service connection"""
@@ -409,12 +411,12 @@ class GatewayConnection(APNsConnection):
         self.port = 2195
         if self.enhanced == True: #start error-response monitoring thread
             import threading
-            self.sent_notifications = []
+            self.sent_notifications = collections.deque(maxlen=SENT_BUFFER_QTY)
             self.error_responses = []
             self.send_lock = threading.RLock()
             self.read_error_response_worker = threading.Thread(target=self.read_error_response)
             self.read_error_response_worker.start()
-            self.is_resending = False
+            self._is_resending = False
             self.last_resent_qty = 10
 
     def _get_notification(self, token_hex, payload):
@@ -451,6 +453,7 @@ class GatewayConnection(APNsConnection):
         in enhanced mode, send_notification may return error response from APNs if any
         """
         if self.enhanced:
+                self._wait_resending(30)
                 with self.send_lock:
                     message = self._get_enhanced_notification(token_hex, payload,
                                                                identifier, expiry)
@@ -463,6 +466,15 @@ class GatewayConnection(APNsConnection):
         else:
             self.write(self._get_notification(token_hex, payload))
 
+    def _wait_resending(self, timeout):
+        elapsed = 0.0
+        interval = 0.01
+        while elapsed < timeout:
+            if not self._is_resending:
+                break
+            time.sleep(interval)
+            elapsed += interval
+
     def send_notification_multiple(self, frame):
         return self.write(frame.get_frame())
     
@@ -472,17 +484,18 @@ class GatewayConnection(APNsConnection):
                 time.sleep(0.1)
             
             rlist, _, _ = select.select([self._connection()], [], [])
-            if _logger: _logger.debug("read ready...") #DEBUG
             
             if len(rlist) > 0: # there's error response from APNs
                 try:
                     buff = self.read(ERROR_RESPONSE_LENGTH)
-                except socket_error as e:
+                except socket_error as e: # APNS close connection arbitrarily
                     if _logger: _logger.debug("read error-response exception: " + str(type(e)) + " msg: " + str(e)) #DEBUG
+                    self._is_resending = True
                     with self.send_lock:
                         self._reconnect()
-                        if _logger: _logger.debug("self.last_resent_qty: " + str(self.last_resent_qty)) #DEBUG
-                        self._resend_notification_by_range(0-self.last_resent_qty, None)
+                        current_sent_qty = len(self.sent_notifications)
+                        resent_first_idx = max(current_sent_qty - self.last_resent_qty, 0)
+                        self._resend_notification_by_range(resent_first_idx, current_sent_qty)
                     continue
                 if len(buff) == ERROR_RESPONSE_LENGTH:
                     command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
@@ -490,6 +503,7 @@ class GatewayConnection(APNsConnection):
                         error_response = (status, identifier)
                         if _logger: _logger.debug("error-response:" + str(error_response))
                         self.error_responses.append(error_response)
+                        self._is_resending = True
                         with self.send_lock:
                             self._reconnect()
                             self._resend_notifications_by_id(identifier)
@@ -497,20 +511,22 @@ class GatewayConnection(APNsConnection):
     def _resend_notifications_by_id(self, failed_identifier):
         fail_idx = Util.getListIndexFromID(self.sent_notifications, failed_identifier)
         #pop-out success notifications till failed one
-        self._resend_notification_by_range(fail_idx+1, None)
+        self._resend_notification_by_range(fail_idx+1, len(self.sent_notifications))
         return
     
     def _resend_notification_by_range(self, start_idx, end_idx):
-        self.sent_notifications = self.sent_notifications[start_idx:end_idx]
+        self.sent_notifications = collections.deque(itertools.islice(self.sent_notifications, start_idx, end_idx))
         self.last_resent_qty = len(self.sent_notifications)
+        if _logger: _logger.debug("msg to resend qty: " + str(self.last_resent_qty)) #DEBUG
         for sent_notification in self.sent_notifications:
             if _logger: _logger.debug("resending to " + str(sent_notification['id'])) #DEBUG
             try:
                 self.write(sent_notification['message'])
             except socket_error as e:
                 if _logger: _logger.debug("re-send to " + str(sent_notification['id']) + " failed: " + str(type(e)) + " msg: " + str(e)) #DEBUG
-                return 
+                return
             time.sleep(DELAY_RESEND_SECS) #DEBUG
+        self._is_resending = False
 
 class Util(object):
     @classmethod
