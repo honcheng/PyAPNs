@@ -413,6 +413,7 @@ class GatewayConnection(APNsConnection):
             import threading
             self._sent_notifications = collections.deque(maxlen=SENT_BUFFER_QTY)
             self._send_lock = threading.RLock()
+            self._close_read_thread = False
             self._read_error_response_worker = threading.Thread(target=self._read_error_response)
             self._read_error_response_worker.start()
             self._is_resending = False
@@ -484,12 +485,15 @@ class GatewayConnection(APNsConnection):
     def register_response_listener(self, response_listener):
         self._response_listener = response_listener
     
+    def close_read_thread(self):
+        self._close_read_thread = True
+    
     def _read_error_response(self):
-        while True:
+        while not self._close_read_thread:
             while not self.connection_alive:
                 time.sleep(0.1)
             
-            rlist, _, _ = select.select([self._connection()], [], [])
+            rlist, _, _ = select.select([self._connection()], [], [], 1)
             
             if len(rlist) > 0: # there's error response from APNs
                 try:
