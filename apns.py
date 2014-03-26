@@ -411,13 +411,13 @@ class GatewayConnection(APNsConnection):
         self.port = 2195
         if self.enhanced == True: #start error-response monitoring thread
             import threading
-            self.sent_notifications = collections.deque(maxlen=SENT_BUFFER_QTY)
-            self.error_responses = []
-            self.send_lock = threading.RLock()
-            self.read_error_response_worker = threading.Thread(target=self.read_error_response)
-            self.read_error_response_worker.start()
+            self._sent_notifications = collections.deque(maxlen=SENT_BUFFER_QTY)
+            self._send_lock = threading.RLock()
+            self._read_error_response_worker = threading.Thread(target=self._read_error_response)
+            self._read_error_response_worker.start()
             self._is_resending = False
-            self.last_resent_qty = 10
+            self._last_resent_qty = 10
+            self._response_listener = None
 
     def _get_notification(self, token_hex, payload):
         """
@@ -454,10 +454,10 @@ class GatewayConnection(APNsConnection):
         """
         if self.enhanced:
                 self._wait_resending(30)
-                with self.send_lock:
+                with self._send_lock:
                     message = self._get_enhanced_notification(token_hex, payload,
                                                                identifier, expiry)
-                    self.sent_notifications.append(dict({'id': identifier, 'message': message}))
+                    self._sent_notifications.append(dict({'id': identifier, 'message': message}))
                     try:
                         self.write(message)
                     except socket_error as e:
@@ -467,6 +467,9 @@ class GatewayConnection(APNsConnection):
             self.write(self._get_notification(token_hex, payload))
 
     def _wait_resending(self, timeout):
+        """
+        timeout: in seconds
+        """
         elapsed = 0.0
         interval = 0.01
         while elapsed < timeout:
@@ -478,7 +481,10 @@ class GatewayConnection(APNsConnection):
     def send_notification_multiple(self, frame):
         return self.write(frame.get_frame())
     
-    def read_error_response(self):
+    def register_response_listener(self, response_listener):
+        self._response_listener = response_listener
+    
+    def _read_error_response(self):
         while True:
             while not self.connection_alive:
                 time.sleep(0.1)
@@ -491,34 +497,35 @@ class GatewayConnection(APNsConnection):
                 except socket_error as e: # APNS close connection arbitrarily
                     if _logger: _logger.debug("read error-response exception: " + str(type(e)) + " msg: " + str(e)) #DEBUG
                     self._is_resending = True
-                    with self.send_lock:
+                    with self._send_lock:
                         self._reconnect()
-                        current_sent_qty = len(self.sent_notifications)
-                        resent_first_idx = max(current_sent_qty - self.last_resent_qty, 0)
+                        current_sent_qty = len(self._sent_notifications)
+                        resent_first_idx = max(current_sent_qty - self._last_resent_qty, 0)
                         self._resend_notification_by_range(resent_first_idx, current_sent_qty)
                     continue
                 if len(buff) == ERROR_RESPONSE_LENGTH:
                     command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
                     if 8 == command: # is error response
                         error_response = (status, identifier)
+                        if self._response_listener:
+                            self._response_listener(Util.convert_error_response_to_dict(error_response))
                         if _logger: _logger.debug("error-response:" + str(error_response))
-                        self.error_responses.append(error_response)
                         self._is_resending = True
-                        with self.send_lock:
+                        with self._send_lock:
                             self._reconnect()
                             self._resend_notifications_by_id(identifier)
     
     def _resend_notifications_by_id(self, failed_identifier):
-        fail_idx = Util.getListIndexFromID(self.sent_notifications, failed_identifier)
+        fail_idx = Util.getListIndexFromID(self._sent_notifications, failed_identifier)
         #pop-out success notifications till failed one
-        self._resend_notification_by_range(fail_idx+1, len(self.sent_notifications))
+        self._resend_notification_by_range(fail_idx+1, len(self._sent_notifications))
         return
     
     def _resend_notification_by_range(self, start_idx, end_idx):
-        self.sent_notifications = collections.deque(itertools.islice(self.sent_notifications, start_idx, end_idx))
-        self.last_resent_qty = len(self.sent_notifications)
-        if _logger: _logger.debug("msg to resend qty: " + str(self.last_resent_qty)) #DEBUG
-        for sent_notification in self.sent_notifications:
+        self._sent_notifications = collections.deque(itertools.islice(self._sent_notifications, start_idx, end_idx))
+        self._last_resent_qty = len(self._sent_notifications)
+        if _logger: _logger.debug("msg to resend qty: " + str(self._last_resent_qty)) #DEBUG
+        for sent_notification in self._sent_notifications:
             if _logger: _logger.debug("resending to " + str(sent_notification['id'])) #DEBUG
             try:
                 self.write(sent_notification['message'])
@@ -533,3 +540,6 @@ class Util(object):
     def getListIndexFromID(this_class, the_list, identifier):
         return next(index for (index, d) in enumerate(the_list) 
                         if d['id'] == identifier)
+    @classmethod
+    def convert_error_response_to_dict(this_class, error_response_tuple):
+        return {'status': error_response_tuple[0], 'identifier': error_response_tuple[1]}
