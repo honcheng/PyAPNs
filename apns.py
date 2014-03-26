@@ -217,6 +217,7 @@ class APNsConnection(object):
         return self._ssl
 
     def _reconnect(self):
+        if _logger: _logger.info("rebuilding connection to APNS")
         self._disconnect()
         self._connect()
 
@@ -462,7 +463,7 @@ class GatewayConnection(APNsConnection):
                     try:
                         self.write(message)
                     except socket_error as e:
-                        if _logger: _logger.debug("send to " + str(identifier) + " failed: " + str(type(e)) + " msg: " + str(e))
+                        if _logger: _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
         
         else:
             self.write(self._get_notification(token_hex, payload))
@@ -499,7 +500,7 @@ class GatewayConnection(APNsConnection):
                 try:
                     buff = self.read(ERROR_RESPONSE_LENGTH)
                 except socket_error as e: # APNS close connection arbitrarily
-                    if _logger: _logger.debug("read error-response exception: " + str(type(e)) + " msg: " + str(e)) #DEBUG
+                    if _logger: _logger.warning("exception occur when reading APNS error-response : " + str(type(e)) + ": " + str(e)) #DEBUG
                     self._is_resending = True
                     with self._send_lock:
                         self._reconnect()
@@ -513,7 +514,7 @@ class GatewayConnection(APNsConnection):
                         error_response = (status, identifier)
                         if self._response_listener:
                             self._response_listener(Util.convert_error_response_to_dict(error_response))
-                        if _logger: _logger.debug("error-response:" + str(error_response))
+                        if _logger: _logger.info("got error-response from APNS:" + str(error_response))
                         self._is_resending = True
                         with self._send_lock:
                             self._reconnect()
@@ -528,13 +529,13 @@ class GatewayConnection(APNsConnection):
     def _resend_notification_by_range(self, start_idx, end_idx):
         self._sent_notifications = collections.deque(itertools.islice(self._sent_notifications, start_idx, end_idx))
         self._last_resent_qty = len(self._sent_notifications)
-        if _logger: _logger.debug("msg to resend qty: " + str(self._last_resent_qty)) #DEBUG
+        if _logger: _logger.info("resending " + str(self._last_resent_qty) + " notifications to APNS") #DEBUG
         for sent_notification in self._sent_notifications:
-            if _logger: _logger.debug("resending to " + str(sent_notification['id'])) #DEBUG
+            if _logger: _logger.debug("resending notification with id:" + str(sent_notification['id']) + " to APNS") #DEBUG
             try:
                 self.write(sent_notification['message'])
             except socket_error as e:
-                if _logger: _logger.debug("re-send to " + str(sent_notification['id']) + " failed: " + str(type(e)) + " msg: " + str(e)) #DEBUG
+                if _logger: _logger.debug("resending notification with id:" + str(sent_notification['id']) + " failed: " + str(type(e)) + ": " + str(e)) #DEBUG
                 return
             time.sleep(DELAY_RESEND_SECS) #DEBUG
         self._is_resending = False
