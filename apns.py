@@ -33,6 +33,7 @@ import ssl
 import select
 import time
 import collections, itertools
+import logging
 
 try:
     from ssl import wrap_socket
@@ -44,7 +45,7 @@ try:
 except ImportError:
     import simplejson as json
 
-_logger = None
+_logger = logging.getLogger(__name__)
 
 MAX_PAYLOAD_LENGTH = 256
 
@@ -83,16 +84,17 @@ ERROR_RESPONSE_LENGTH = 6
 DELAY_RESEND_SECS = 0.0
 SENT_BUFFER_QTY = 3000
 
+ER_STATUS = 'status'
+ER_IDENTIFER = 'identifier'
+
 class APNs(object):
     """A class representing an Apple Push Notification service connection"""
 
-    def __init__(self, use_sandbox=False, cert_file=None, key_file=None, enhanced=False, logger=None):
+    def __init__(self, use_sandbox=False, cert_file=None, key_file=None, enhanced=False):
         """
         Set use_sandbox to True to use the sandbox (test) APNs servers.
         Default is False.
         """
-        global _logger
-        _logger = logger
         super(APNs, self).__init__()
         self.use_sandbox = use_sandbox
         self.cert_file = cert_file
@@ -217,7 +219,7 @@ class APNsConnection(object):
         return self._ssl
 
     def _reconnect(self):
-        if _logger: _logger.info("rebuilding connection to APNS")
+        _logger.info("rebuilding connection to APNS")
         self._disconnect()
         self._connect()
 
@@ -463,7 +465,7 @@ class GatewayConnection(APNsConnection):
                     try:
                         self.write(message)
                     except socket_error as e:
-                        if _logger: _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
+                        _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
         
         else:
             self.write(self._get_notification(token_hex, payload))
@@ -500,7 +502,7 @@ class GatewayConnection(APNsConnection):
                 try:
                     buff = self.read(ERROR_RESPONSE_LENGTH)
                 except socket_error as e: # APNS close connection arbitrarily
-                    if _logger: _logger.warning("exception occur when reading APNS error-response : " + str(type(e)) + ": " + str(e)) #DEBUG
+                    _logger.warning("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
                     self._is_resending = True
                     with self._send_lock:
                         self._reconnect()
@@ -514,7 +516,7 @@ class GatewayConnection(APNsConnection):
                         error_response = (status, identifier)
                         if self._response_listener:
                             self._response_listener(Util.convert_error_response_to_dict(error_response))
-                        if _logger: _logger.info("got error-response from APNS:" + str(error_response))
+                        _logger.info("got error-response from APNS:" + str(error_response))
                         self._is_resending = True
                         with self._send_lock:
                             self._reconnect()
@@ -529,13 +531,13 @@ class GatewayConnection(APNsConnection):
     def _resend_notification_by_range(self, start_idx, end_idx):
         self._sent_notifications = collections.deque(itertools.islice(self._sent_notifications, start_idx, end_idx))
         self._last_resent_qty = len(self._sent_notifications)
-        if _logger: _logger.info("resending " + str(self._last_resent_qty) + " notifications to APNS") #DEBUG
+        _logger.info("resending " + str(self._last_resent_qty) + " notifications to APNS") #DEBUG
         for sent_notification in self._sent_notifications:
-            if _logger: _logger.debug("resending notification with id:" + str(sent_notification['id']) + " to APNS") #DEBUG
+            _logger.debug("resending notification with id:" + str(sent_notification['id']) + " to APNS") #DEBUG
             try:
                 self.write(sent_notification['message'])
             except socket_error as e:
-                if _logger: _logger.debug("resending notification with id:" + str(sent_notification['id']) + " failed: " + str(type(e)) + ": " + str(e)) #DEBUG
+                _logger.debug("resending notification with id:" + str(sent_notification['id']) + " failed: " + str(type(e)) + ": " + str(e)) #DEBUG
                 return
             time.sleep(DELAY_RESEND_SECS) #DEBUG
         self._is_resending = False
@@ -547,4 +549,4 @@ class Util(object):
                         if d['id'] == identifier)
     @classmethod
     def convert_error_response_to_dict(this_class, error_response_tuple):
-        return {'status': error_response_tuple[0], 'identifier': error_response_tuple[1]}
+        return {ER_STATUS: error_response_tuple[0], ER_IDENTIFER: error_response_tuple[1]}
