@@ -10,5 +10,5 @@ setup(
     py_modules = ['apns'],
     scripts = ['apns-send'],
     url = 'http://www.goosoftware.co.uk/',
-    version = '2014.2.27.qnap',
+    version = '2014.07.04.qnap',
 )
