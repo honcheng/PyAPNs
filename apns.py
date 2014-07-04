@@ -25,7 +25,7 @@
 
 from binascii import a2b_hex, b2a_hex
 from datetime import datetime
-from socket import socket, AF_INET, SOCK_STREAM
+from socket import socket, timeout, AF_INET, SOCK_STREAM
 from socket import error as socket_error
 from struct import pack, unpack
 import sys
@@ -34,11 +34,12 @@ import select
 import time
 import collections, itertools
 import logging
-
 try:
-    from ssl import wrap_socket
+    from ssl import wrap_socket, SSLError
 except ImportError:
-    from socket import ssl as wrap_socket
+    from socket import ssl as wrap_socket, sslerror as SSLError
+
+from _ssl import SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE
 
 try:
     import json
@@ -172,10 +173,11 @@ class APNsConnection(object):
     """
     A generic connection class for communicating with the APNs
     """
-    def __init__(self, cert_file=None, key_file=None, enhanced=False):
+    def __init__(self, cert_file=None, key_file=None, timeout=None, enhanced=False):
         super(APNsConnection, self).__init__()
         self.cert_file = cert_file
         self.key_file = key_file
+        self.timeout = timeout
         self._socket = None
         self._ssl = None
         self.enhanced = enhanced
@@ -186,8 +188,19 @@ class APNsConnection(object):
 
     def _connect(self):
         # Establish an SSL connection
-        self._socket = socket(AF_INET, SOCK_STREAM)
-        self._socket.connect((self.server, self.port))
+
+        # Fallback for socket timeout.
+        for i in xrange(3):
+            try:
+                self._socket = socket(AF_INET, SOCK_STREAM)
+                self._socket.settimeout(self.timeout)
+                self._socket.connect((self.server, self.port))
+                break
+            except timeout:
+                pass
+            except:
+                raise
+
         if self.enhanced:
              self._socket.setblocking(False)
              self._ssl = wrap_socket(self._socket, self.key_file, self.cert_file,
@@ -205,7 +218,18 @@ class APNsConnection(object):
                      else:
                          raise
         else:
-             self._ssl = ssl.wrap_socket(self._socket, self.key_file, self.cert_file)
+            # Fallback for 'SSLError: _ssl.c:489: The handshake operation timed out'
+            for i in xrange(3):
+                try:
+                    self._ssl = wrap_socket(self._socket, self.key_file, self.cert_file)
+                    break
+                except SSLError, ex:
+                    if ex.args[0] == SSL_ERROR_WANT_READ:
+                        sys.exc_clear()
+                    elif ex.args[0] == SSL_ERROR_WANT_WRITE:
+                        sys.exc_clear()
+                    else:
+                       raise
 
     def _disconnect(self):
         if self._socket:
@@ -233,11 +257,11 @@ class APNsConnection(object):
             if len(wlist) > 0:
                 self._connection().sendall(string)
         else: # blocking socket
-             return self._connection().sendall(string)
+             return self._connection().write(string)
 
 
 class PayloadAlert(object):
-    def __init__(self, body, action_loc_key=None, loc_key=None,
+    def __init__(self, body=None, action_loc_key=None, loc_key=None,
                  loc_args=None, launch_image=None):
         super(PayloadAlert, self).__init__()
         self.body = body
@@ -247,7 +271,9 @@ class PayloadAlert(object):
         self.launch_image = launch_image
 
     def dict(self):
-        d = { 'body': self.body }
+        d = {}
+        if self.body:
+            d['body'] = self.body
         if self.action_loc_key:
             d['action-loc-key'] = self.action_loc_key
         if self.loc_key:
@@ -316,37 +342,45 @@ class Frame(object):
 
     def add_item(self, token_hex, payload, identifier, expiry, priority):
         """Add a notification message to the frame"""
+        item_len = 0
+        self.frame_data.extend('\2' + APNs.packed_uint_big_endian(item_len))
+
         token_bin = a2b_hex(token_hex)
         token_length_bin = APNs.packed_ushort_big_endian(len(token_bin))
         token_item = '\1' + token_length_bin + token_bin
         self.frame_data.extend(token_item)
-        
+        item_len += len(token_item)
+
         payload_json = payload.json()
         payload_length_bin = APNs.packed_ushort_big_endian(len(payload_json))
         payload_item = '\2' + payload_length_bin + payload_json
         self.frame_data.extend(payload_item)
+        item_len += len(payload_item)
 
         identifier_bin = APNs.packed_uint_big_endian(identifier)
         identifier_length_bin = \
                 APNs.packed_ushort_big_endian(len(identifier_bin))
         identifier_item = '\3' + identifier_length_bin + identifier_bin
         self.frame_data.extend(identifier_item)
+        item_len += len(identifier_item)
 
         expiry_bin = APNs.packed_uint_big_endian(expiry)
         expiry_length_bin = APNs.packed_ushort_big_endian(len(expiry_bin))
         expiry_item = '\4' + expiry_length_bin + expiry_bin
         self.frame_data.extend(expiry_item)
+        item_len += len(expiry_item)
 
         priority_bin = APNs.packed_uchar(priority)
         priority_length_bin = APNs.packed_ushort_big_endian(len(priority_bin))
         priority_item = '\5' + priority_length_bin + priority_bin
         self.frame_data.extend(priority_item)
-    
-    def get_frame(self):
-        """Get the frame buffer"""
-        return str('\2' + APNs.packed_uint_big_endian(len(self.frame_data)) +
-                self.frame_data)
+        item_len += len(priority_item)
 
+        self.frame_data[-item_len-4:-item_len] = APNs.packed_uint_big_endian(item_len)
+
+    def __str__(self):
+        """Get the frame buffer"""
+        return str(self.frame_data)
 
 class FeedbackConnection(APNsConnection):
     """
@@ -457,15 +491,15 @@ class GatewayConnection(APNsConnection):
         in enhanced mode, send_notification may return error response from APNs if any
         """
         if self.enhanced:
-                self._wait_resending(30)
-                with self._send_lock:
-                    message = self._get_enhanced_notification(token_hex, payload,
-                                                               identifier, expiry)
-                    self._sent_notifications.append(dict({'id': identifier, 'message': message}))
-                    try:
-                        self.write(message)
-                    except socket_error as e:
-                        _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
+            self._wait_resending(30)
+            with self._send_lock:
+                message = self._get_enhanced_notification(token_hex, payload,
+                                                           identifier, expiry)
+                self._sent_notifications.append(dict({'id': identifier, 'message': message}))
+                try:
+                    self.write(message)
+                except socket_error as e:
+                    _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
         
         else:
             self.write(self._get_notification(token_hex, payload))
