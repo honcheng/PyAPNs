@@ -34,6 +34,7 @@ import select
 import time
 import collections, itertools
 import logging
+import threading
 try:
     from ssl import wrap_socket, SSLError
 except ImportError:
@@ -188,6 +189,7 @@ class APNsConnection(object):
 
     def _connect(self):
         # Establish an SSL connection
+        _logger.debug("establishing ssl connection...")
 
         # Fallback for socket timeout.
         for i in xrange(3):
@@ -202,21 +204,21 @@ class APNsConnection(object):
                 raise
 
         if self.enhanced:
-             self._socket.setblocking(False)
-             self._ssl = wrap_socket(self._socket, self.key_file, self.cert_file,
-                                         do_handshake_on_connect=False)
-             while True:
-                 try:
-                     self._ssl.do_handshake()
-                     self.connection_alive = True
-                     break
-                 except ssl.SSLError, err:
-                     if ssl.SSL_ERROR_WANT_READ == err.args[0]:
-                         select.select([self._ssl], [], [])
-                     elif ssl.SSL_ERROR_WANT_WRITE == err.args[0]:
-                         select.select([], [self._ssl], [])
-                     else:
-                         raise
+            self._socket.setblocking(False)
+            self._ssl = wrap_socket(self._socket, self.key_file, self.cert_file,
+                                        do_handshake_on_connect=False)
+            while True:
+                try:
+                    self._ssl.do_handshake()
+                    self.connection_alive = True
+                    break
+                except ssl.SSLError, err:
+                    if ssl.SSL_ERROR_WANT_READ == err.args[0]:
+                        select.select([self._ssl], [], [])
+                    elif ssl.SSL_ERROR_WANT_WRITE == err.args[0]:
+                        select.select([], [self._ssl], [])
+                    else:
+                        raise
         else:
             # Fallback for 'SSLError: _ssl.c:489: The handshake operation timed out'
             for i in xrange(3):
@@ -230,15 +232,18 @@ class APNsConnection(object):
                         sys.exc_clear()
                     else:
                        raise
+        _logger.debug("established ssl connection...")
 
     def _disconnect(self):
         if self._socket:
             self._socket.close()
-            self._connection().close()
+            if self.connection_alive:
+                self._connection().close()
         self.connection_alive = False
+        _logger.info("APNS connection closed from client side")
 
     def _connection(self):
-        if not self._ssl:
+        if not self._ssl or not self.connection_alive:
             self._connect()
         return self._ssl
 
@@ -251,11 +256,18 @@ class APNsConnection(object):
         return self._connection().read(n)
 
     def write(self, string):
-#         return self._connection().write(string)
+        WAIT_WRITE_TIMEOUT_SECS=10
         if self.enhanced: # nonblocking socket
-            _, wlist, _ = select.select([], [self._connection()], [])
+            _, wlist, err = select.select([], [self._connection()], [self._connection()], WAIT_WRITE_TIMEOUT_SECS)
+            
+            if len(err) > 0:
+                _logger.debug("read select error: " + str(err))
+            
             if len(wlist) > 0:
                 self._connection().sendall(string)
+            else:
+                _logger.warning("write socket descriptor is not ready after " + str(WAIT_WRITE_TIMEOUT_SECS))
+            
         else: # blocking socket
              return self._connection().write(string)
 
@@ -440,22 +452,26 @@ class GatewayConnection(APNsConnection):
     """
     A class that represents a connection to the APNs gateway server
     """
+    
     def __init__(self, use_sandbox=False, **kwargs):
         super(GatewayConnection, self).__init__(**kwargs)
         self.server = (
             'gateway.push.apple.com',
             'gateway.sandbox.push.apple.com')[use_sandbox]
         self.port = 2195
-        if self.enhanced == True: #start error-response monitoring thread
-            import threading
+        if self.enhanced == True: #start error-response monitoring thread            
             self._sent_notifications = collections.deque(maxlen=SENT_BUFFER_QTY)
-            self._send_lock = threading.RLock()
-            self._close_read_thread = False
-            self._read_error_response_worker = threading.Thread(target=self._read_error_response)
-            self._read_error_response_worker.start()
-            self._is_resending = False
+            self._init_read_error_response_worker()
             self._last_resent_qty = 10
             self._response_listener = None
+
+    def _init_read_error_response_worker(self):
+        self._send_lock = threading.RLock()
+        self._close_read_thread = False
+        self._read_error_response_worker = threading.Thread(target=self._read_error_response)
+        self._read_error_response_worker.start()
+        self._is_resending = False
+        _logger.debug("initialized error-response reader worker")
 
     def _get_notification(self, token_hex, payload):
         """
@@ -476,34 +492,43 @@ class GatewayConnection(APNsConnection):
         return notification
 
     def _get_enhanced_notification(self, token_hex, payload, identifier, expiry):
-         """
-         form notification data in an enhanced format
-         """
-         token = a2b_hex(token_hex)
-         payload = payload.json()
-         fmt = ENHANCED_NOTIFICATION_FORMAT % len(payload)
-         notification = pack(fmt, ENHANCED_NOTIFICATION_COMMAND, identifier, expiry,
-                             TOKEN_LENGTH, token, len(payload), payload)
-         return notification
+        """
+        form notification data in an enhanced format
+        """
+        token = a2b_hex(token_hex)
+        payload = payload.json()
+        fmt = ENHANCED_NOTIFICATION_FORMAT % len(payload)
+        notification = pack(fmt, ENHANCED_NOTIFICATION_COMMAND, identifier, expiry,
+                            TOKEN_LENGTH, token, len(payload), payload)
+        return notification
          
     def send_notification(self, token_hex, payload, identifier=0, expiry=0):
         """
         in enhanced mode, send_notification may return error response from APNs if any
         """
         if self.enhanced:
+            self._make_sure_read_error_worker_alive()
             self._wait_resending(30)
             with self._send_lock:
                 message = self._get_enhanced_notification(token_hex, payload,
                                                            identifier, expiry)
                 self._sent_notifications.append(dict({'id': identifier, 'message': message}))
-                try:
-                    self.write(message)
-                except socket_error as e:
-                    _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
+                for i in xrange(3):
+                    try:
+                        self.write(message)
+                        break
+                    except socket_error as e:
+                        _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
+                        self._disconnect()
+                        time.sleep(3 * (i + 1))
         
         else:
             self.write(self._get_notification(token_hex, payload))
-
+    
+    def _make_sure_read_error_worker_alive(self):
+        if not self._read_error_response_worker.is_alive():
+            self._init_read_error_response_worker()
+    
     def _wait_resending(self, timeout):
         """
         timeout: in seconds
@@ -531,7 +556,10 @@ class GatewayConnection(APNsConnection):
             while not self.connection_alive:
                 time.sleep(0.1)
             
-            rlist, _, _ = select.select([self._connection()], [], [], 1)
+            rlist, _, err = select.select([self._connection()], [], [self._connection()], 1)
+            
+            if len(err) > 0:
+                _logger.debug("read select error: " + str(err))
             
             if len(rlist) > 0: # there's error response from APNs
                 try:
@@ -540,7 +568,7 @@ class GatewayConnection(APNsConnection):
                     _logger.warning("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
                     self._is_resending = True
                     with self._send_lock:
-                        self._reconnect()
+                        self._disconnect()
                         current_sent_qty = len(self._sent_notifications)
                         resent_first_idx = max(current_sent_qty - self._last_resent_qty, 0)
                         self._resend_notification_by_range(resent_first_idx, current_sent_qty)
@@ -554,7 +582,7 @@ class GatewayConnection(APNsConnection):
                         _logger.info("got error-response from APNS:" + str(error_response))
                         self._is_resending = True
                         with self._send_lock:
-                            self._reconnect()
+                            self._disconnect()
                             self._resend_notifications_by_id(identifier)
     
     def _resend_notifications_by_id(self, failed_identifier):
