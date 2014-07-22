@@ -235,12 +235,13 @@ class APNsConnection(object):
         _logger.debug("established ssl connection...")
 
     def _disconnect(self):
-        if self._socket:
-            self._socket.close()
-            if self.connection_alive:
-                self._connection().close()
-        self.connection_alive = False
-        _logger.info("APNS connection closed from client side")
+        if self.connection_alive:
+            if self._socket:
+                self._socket.close()
+            if self._ssl:
+                self._ssl.close()
+            self.connection_alive = False
+            _logger.info("close APNS connection")
 
     def _connection(self):
         if not self._ssl or not self.connection_alive:
@@ -258,10 +259,7 @@ class APNsConnection(object):
     def write(self, string):
         WAIT_WRITE_TIMEOUT_SECS=10
         if self.enhanced: # nonblocking socket
-            _, wlist, err = select.select([], [self._connection()], [self._connection()], WAIT_WRITE_TIMEOUT_SECS)
-            
-            if len(err) > 0:
-                _logger.debug("read select error: " + str(err))
+            _, wlist, _ = select.select([], [self._connection()], [], WAIT_WRITE_TIMEOUT_SECS)
             
             if len(wlist) > 0:
                 self._connection().sendall(string)
@@ -468,9 +466,10 @@ class GatewayConnection(APNsConnection):
     def _init_read_error_response_worker(self):
         self._send_lock = threading.RLock()
         self._close_read_thread = False
+        self._last_activity_time = time.time()
+        self._is_resending = False
         self._read_error_response_worker = threading.Thread(target=self._read_error_response)
         self._read_error_response_worker.start()
-        self._is_resending = False
         _logger.debug("initialized error-response reader worker")
 
     def _get_notification(self, token_hex, payload):
@@ -508,19 +507,24 @@ class GatewayConnection(APNsConnection):
         """
         if self.enhanced:
             self._make_sure_read_error_worker_alive()
-            self._wait_resending(30)
-            with self._send_lock:
-                message = self._get_enhanced_notification(token_hex, payload,
+#             self._wait_resending(30)
+            message = self._get_enhanced_notification(token_hex, payload,
                                                            identifier, expiry)
-                self._sent_notifications.append(dict({'id': identifier, 'message': message}))
-                for i in xrange(3):
-                    try:
+            
+            for i in xrange(3):
+                try:
+                    with self._send_lock:
                         self.write(message)
-                        break
-                    except socket_error as e:
-                        _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
-                        self._disconnect()
-                        time.sleep(3 * (i + 1))
+                        self._sent_notifications.append(dict({'id': identifier, 'message': message}))
+                    break
+                except socket_error as e:
+                    delay = 10 + (i * 2)
+                    _logger.info("sending notification with id:" + str(identifier) + 
+                                 " to APNS failed: " + str(type(e)) + ": " + str(e) + 
+                                 " will retry in " + str(delay) + " secs")
+                    time.sleep(delay) # wait potential error-response to be read
+            
+            self._last_activity_time = time.time()
         
         else:
             self.write(self._get_notification(token_hex, payload))
@@ -551,39 +555,46 @@ class GatewayConnection(APNsConnection):
         self._close_read_thread = True
     
     def _read_error_response(self):
-        while not self._close_read_thread:
+        TIMEOUT_WAIT_READ_READY = 10
+        while not self._close_read_thread and not self._is_idle_timeout():
             time.sleep(0.1) #avoid crazy loop if something bad happened. e.g. using invalid certificate
             while not self.connection_alive:
                 time.sleep(0.1)
             
-            rlist, _, err = select.select([self._connection()], [], [self._connection()], 1)
+            rlist, _, _ = select.select([self._connection()], [], [], TIMEOUT_WAIT_READ_READY)
             
-            if len(err) > 0:
-                _logger.debug("read select error: " + str(err))
-            
-            if len(rlist) > 0: # there's error response from APNs
-                try:
-                    buff = self.read(ERROR_RESPONSE_LENGTH)
-                except socket_error as e: # APNS close connection arbitrarily
-                    _logger.warning("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
-                    self._is_resending = True
-                    with self._send_lock:
+            if len(rlist) > 0: # there's some data from APNs
+                self._is_resending = True
+                with self._send_lock:
+                    try:
+                        buff = self.read(ERROR_RESPONSE_LENGTH)
+                    except socket_error as e: # APNS close connection arbitrarily
+                        _logger.warning("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
                         self._disconnect()
                         current_sent_qty = len(self._sent_notifications)
                         resent_first_idx = max(current_sent_qty - self._last_resent_qty, 0)
                         self._resend_notification_by_range(resent_first_idx, current_sent_qty)
-                    continue
-                if len(buff) == ERROR_RESPONSE_LENGTH:
-                    command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
-                    if 8 == command: # is error response
-                        error_response = (status, identifier)
-                        if self._response_listener:
-                            self._response_listener(Util.convert_error_response_to_dict(error_response))
-                        _logger.info("got error-response from APNS:" + str(error_response))
-                        self._is_resending = True
-                        with self._send_lock:
+                        continue
+                    if len(buff) == ERROR_RESPONSE_LENGTH:
+                        command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
+                        if 8 == command: # there is error response from APNS
+                            error_response = (status, identifier)
+                            if self._response_listener:
+                                self._response_listener(Util.convert_error_response_to_dict(error_response))
+                            _logger.info("got error-response from APNS:" + str(error_response))
+                            self._is_resending = True
                             self._disconnect()
                             self._resend_notifications_by_id(identifier)
+                    if len(buff) == 0:
+                        _logger.warning("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
+                        self._disconnect()
+                        current_sent_qty = len(self._sent_notifications)
+                        resent_first_idx = max(current_sent_qty - self._last_resent_qty, 0)
+                        self._resend_notification_by_range(resent_first_idx, current_sent_qty)
+    
+    def _is_idle_timeout(self):
+        TIMEOUT_IDLE = 30
+        return (time.time() - self._last_activity_time) >= TIMEOUT_IDLE
     
     def _resend_notifications_by_id(self, failed_identifier):
         fail_idx = Util.getListIndexFromID(self._sent_notifications, failed_identifier)
@@ -604,6 +615,7 @@ class GatewayConnection(APNsConnection):
                 return
             time.sleep(DELAY_RESEND_SECS) #DEBUG
         self._is_resending = False
+        self._last_activity_time = time.time()
 
 class Util(object):
     @classmethod
