@@ -262,12 +262,13 @@ class APNsConnection(object):
             _, wlist, _ = select.select([], [self._connection()], [], WAIT_WRITE_TIMEOUT_SECS)
             
             if len(wlist) > 0:
-                self._connection().sendall(string)
+                length = self._connection().sendall(string)
+                _logger.debug("sent length: %d" % length) #DEBUG
             else:
                 _logger.warning("write socket descriptor is not ready after " + str(WAIT_WRITE_TIMEOUT_SECS))
             
         else: # blocking socket
-             return self._connection().write(string)
+            return self._connection().write(string)
 
 
 class PayloadAlert(object):
@@ -519,7 +520,7 @@ class GatewayConnection(APNsConnection):
                     break
                 except socket_error as e:
                     delay = 10 + (i * 2)
-                    _logger.info("sending notification with id:" + str(identifier) + 
+                    _logger.exception("sending notification with id:" + str(identifier) + 
                                  " to APNS failed: " + str(type(e)) + ": " + str(e) + 
                                  " will retry in " + str(delay) + " secs")
                     time.sleep(delay) # wait potential error-response to be read
@@ -557,40 +558,38 @@ class GatewayConnection(APNsConnection):
     def _read_error_response(self):
         TIMEOUT_WAIT_READ_READY = 10
         while not self._close_read_thread and not self._is_idle_timeout():
-            time.sleep(0.1) #avoid crazy loop if something bad happened. e.g. using invalid certificate
-            while not self.connection_alive:
-                time.sleep(0.1)
+            if not self.connection_alive:
+                continue
             
-            rlist, _, _ = select.select([self._connection()], [], [], TIMEOUT_WAIT_READ_READY)
-            
-            if len(rlist) > 0: # there's some data from APNs
-                self._is_resending = True
-                with self._send_lock:
-                    try:
+            try:
+                rlist, _, _ = select.select([self._connection()], [], [], TIMEOUT_WAIT_READ_READY)
+                
+                if len(rlist) > 0: # there's some data from APNs
+                    self._is_resending = True
+                    with self._send_lock:
                         buff = self.read(ERROR_RESPONSE_LENGTH)
-                    except socket_error as e: # APNS close connection arbitrarily
-                        _logger.warning("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
-                        self._disconnect()
-                        current_sent_qty = len(self._sent_notifications)
-                        resent_first_idx = max(current_sent_qty - self._last_resent_qty, 0)
-                        self._resend_notification_by_range(resent_first_idx, current_sent_qty)
-                        continue
-                    if len(buff) == ERROR_RESPONSE_LENGTH:
-                        command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
-                        if 8 == command: # there is error response from APNS
-                            error_response = (status, identifier)
-                            if self._response_listener:
-                                self._response_listener(Util.convert_error_response_to_dict(error_response))
-                            _logger.info("got error-response from APNS:" + str(error_response))
-                            self._is_resending = True
+                        if len(buff) == ERROR_RESPONSE_LENGTH:
+                            command, status, identifier = unpack(ERROR_RESPONSE_FORMAT, buff)
+                            if 8 == command: # there is error response from APNS
+                                error_response = (status, identifier)
+                                if self._response_listener:
+                                    self._response_listener(Util.convert_error_response_to_dict(error_response))
+                                _logger.info("got error-response from APNS:" + str(error_response))
+                                self._is_resending = True
+                                self._disconnect()
+                                self._resend_notifications_by_id(identifier)
+                        if len(buff) == 0:
+                            _logger.warning("read socket got 0 bytes data") #DEBUG
                             self._disconnect()
-                            self._resend_notifications_by_id(identifier)
-                    if len(buff) == 0:
-                        _logger.warning("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
-                        self._disconnect()
-                        current_sent_qty = len(self._sent_notifications)
-                        resent_first_idx = max(current_sent_qty - self._last_resent_qty, 0)
-                        self._resend_notification_by_range(resent_first_idx, current_sent_qty)
+                            
+            except socket_error as e: # APNS close connection arbitrarily
+                _logger.exception("exception occur when reading APNS error-response: " + str(type(e)) + ": " + str(e)) #DEBUG
+#                 self._disconnect()
+                continue
+                        
+            time.sleep(0.1) #avoid crazy loop if something bad happened. e.g. using invalid certificate
+        
+        _logger.debug("read e-r thread close") #DEBUG
     
     def _is_idle_timeout(self):
         TIMEOUT_IDLE = 30
